@@ -1,0 +1,223 @@
+import yfinance as yf
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+import tkinter as tk
+from tkinter import ttk, messagebox
+from PIL import Image, ImageTk, Image, ImageDraw, ImageFont
+import threading
+
+def fetch_and_plot(stocks, risk_tolerance, progress_var, completion_label):
+    global has_optimal_solution
+    # 獲取股價數據
+    data = yf.download(stocks, start="2020-01-01", end="2023-01-01")['Adj Close']
+
+    # 計算每日收益率
+    returns = data.pct_change().dropna()
+
+    # 計算平均收益率和協方差矩陣
+    mean_returns = returns.mean()
+    cov_matrix = returns.cov()
+
+    # 設定模擬參數
+    num_portfolios = 10000
+    results = np.zeros((4 + len(stocks), num_portfolios))  # 增加一行來存儲權重
+
+    # 進行蒙特卡羅模擬
+    for i in range(num_portfolios):
+        weights = np.random.random(len(stocks))
+        weights /= np.sum(weights)
+        portfolio_return = np.sum(mean_returns * weights) * 252
+        portfolio_stddev = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights))) * np.sqrt(252)
+        portfolio_sharpe = portfolio_return / portfolio_stddev
+        results[0, i] = portfolio_return
+        results[1, i] = portfolio_stddev
+        results[2, i] = portfolio_sharpe
+        results[3, i] = results[0, i] / results[1, i]
+        results[4:, i] = weights  # 存儲每個股票的權重
+
+        # 更新進度條
+        if i % (num_portfolios // 100) == 0:
+            progress_var.set(i / num_portfolios * 100)
+
+    progress_var.set(100)  # 完成進度
+    completion_label.config(text="Calculation completed")
+
+    # 將結果轉為DataFrame
+    columns = ['Return', 'StdDev', 'Sortino', 'Sharpe'] + stocks
+    results_frame = pd.DataFrame(results.T, columns=columns)
+
+    # 使用均值-方差分析構建高效前沿
+    def portfolio_annual_performance(weights, mean_returns, cov_matrix):
+        returns = np.sum(mean_returns * weights) * 252
+        std = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights))) * np.sqrt(252)
+        return std, returns
+
+    def minimize_volatility(weights, mean_returns, cov_matrix):
+        return portfolio_annual_performance(weights, mean_returns, cov_matrix)[0]
+
+    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1},)
+    bounds = tuple((0, 1) for asset in range(len(stocks)))
+
+    efficient_frontier_y = []
+    efficient_frontier_x = []
+
+    target_returns = np.linspace(min(mean_returns) * 252, max(mean_returns) * 252, 100)
+    for r in target_returns:
+        additional_constraints = constraints + ({'type': 'eq', 'fun': lambda x: portfolio_annual_performance(x, mean_returns, cov_matrix)[1] - r},)
+        result = minimize(minimize_volatility, len(stocks) * [1. / len(stocks), ], args=(mean_returns, cov_matrix),
+                          method='SLSQP', bounds=bounds, constraints=additional_constraints)
+        efficient_frontier_x.append(result['fun'])
+        efficient_frontier_y.append(r)
+
+    # 找到最低風險組合和最大回報組合
+    min_vol_portfolio = results_frame.loc[results_frame['StdDev'].idxmin()]
+    min_vol_weights = min_vol_portfolio[stocks]
+    max_return_portfolio = results_frame.loc[results_frame['Return'].idxmax()]
+    max_return_weights = max_return_portfolio[stocks]
+
+    # 繪製蒙特卡洛模擬的有效前延
+    plt.figure(figsize=(10, 7))
+    plt.scatter(results_frame.StdDev, results_frame.Return, c=results_frame.Sharpe, cmap='viridis', label='Monte Carlo Simulation')
+    plt.colorbar(label='Sharpe Ratio')
+
+    # 繪製均值-方差分析的高效前延
+    plt.plot(efficient_frontier_x, efficient_frontier_y, color='r', marker='x', label='Efficient Frontier (Mean-Variance)')
+
+    # 標示最佳組合
+    filtered_portfolios = results_frame.loc[(results_frame.StdDev <= risk_tolerance)]
+    if not filtered_portfolios.empty:
+        optimal_risk_portfolio = filtered_portfolios.sort_values('Return', ascending=False).iloc[0]
+        plt.scatter(optimal_risk_portfolio['StdDev'], optimal_risk_portfolio['Return'], marker='*', color='r', s=200, label='Optimal Risk Portfolio')
+        plt.annotate('Optimal Portfolio', (optimal_risk_portfolio['StdDev'], optimal_risk_portfolio['Return']), textcoords="offset points", xytext=(-10,10), ha='center')
+        has_optimal_solution = True
+    else:
+        has_optimal_solution = False
+
+    # 標示最低風險組合
+    plt.scatter(min_vol_portfolio['StdDev'], min_vol_portfolio['Return'], marker='o', color='y', s=100, label='Minimum Volatility Portfolio')
+    plt.annotate('Minimum Volatility Portfolio', (min_vol_portfolio['StdDev'], min_vol_portfolio['Return']), textcoords="offset points", xytext=(-10,10), ha='center')
+
+    # 標示最大回報組合
+    plt.scatter(max_return_portfolio['StdDev'], max_return_portfolio['Return'], marker='D', color='g', s=100, label='Max Return Portfolio')
+    plt.annotate('Max Return Portfolio', (max_return_portfolio['StdDev'], max_return_portfolio['Return']), textcoords="offset points", xytext=(-10,10), ha='center')
+
+    plt.xlabel('Volatility')
+    plt.ylabel('Return')
+    plt.title('Efficient Frontier Comparison')
+    plt.legend()
+
+    # 顯示圖表
+    plt.savefig('efficient_frontier.png')
+    plt.close()
+
+    def save_pie_chart_with_info(weights, title, filename, sharpe, returns, risk):
+        fig, ax = plt.subplots(figsize=(10, 7))
+        weights.plot(kind='pie', autopct='%1.1f%%', ax=ax)
+        plt.title(title)
+        plt.ylabel('')
+        
+        # 在圖片上添加文本信息
+        text_info = f"Sharpe Ratio: {sharpe:.2f}\nReturn: {returns:.2f}\nRisk: {risk:.2f}"
+        plt.gca().text(-1.5, -1.0, text_info, fontsize=12, bbox=dict(facecolor='white', alpha=0.5))
+
+        plt.savefig(filename)
+        plt.close()
+
+    # 如果有找到最佳組合，顯示最佳組合的股票權重
+    if has_optimal_solution:
+        optimal_weights = optimal_risk_portfolio[stocks]
+        save_pie_chart_with_info(
+            optimal_weights,
+            'Stock Weights in Optimal Portfolio',
+            'optimal_portfolio_weights.png',
+            optimal_risk_portfolio['Sharpe'],
+            optimal_risk_portfolio['Return'],
+            optimal_risk_portfolio['StdDev']
+        )
+    else:
+        with open("optimal_portfolio_weights.png", "w") as f:
+            f.write("沒有最佳解")
+
+    # 繪製最低風險組合的股票權重
+    save_pie_chart_with_info(
+        min_vol_weights,
+        'Stock Weights in Minimum Volatility Portfolio',
+        'min_vol_portfolio_weights.png',
+        min_vol_portfolio['Sharpe'],
+        min_vol_portfolio['Return'],
+        min_vol_portfolio['StdDev']
+    )
+
+    # 繪製最大回報組合的股票權重
+    save_pie_chart_with_info(
+        max_return_weights,
+        'Stock Weights in Max Return Portfolio',
+        'max_return_portfolio_weights.png',
+        max_return_portfolio['Sharpe'],
+        max_return_portfolio['Return'],
+        max_return_portfolio['StdDev']
+    )
+
+def show_image(image_path):
+    img = Image.open(image_path)
+    img.show()
+
+def generate_portfolio():
+    stocks = stock_input.get().split(',')
+    try:
+        risk_tolerance = float(risk_input.get())
+    except ValueError:
+        messagebox.showerror("Invalid Input", "Risk tolerance must be a number")
+        return
+    progress_var.set(0)
+    completion_label.config(text="")  # 清除之前的完成消息
+    threading.Thread(target=lambda: fetch_and_plot(stocks, risk_tolerance, progress_var, completion_label)).start()
+
+#  Tkinter 
+root = tk.Tk()
+root.title("Portfolio Optimization")
+
+frame = tk.Frame(root)
+frame.pack(pady=20)
+
+# 股票收入
+tk.Label(frame, text="Enter stock tickers (comma separated):").grid(row=0, column=0, pady=5)
+stock_input = tk.Entry(frame, width=50)
+stock_input.grid(row=0, column=1, pady=5)
+
+# 風險承受能力
+tk.Label(frame, text="Enter risk tolerance (e.g., 0.2 for 20%):").grid(row=1, column=0, pady=5)
+risk_input = tk.Entry(frame, width=50)
+risk_input.grid(row=1, column=1, pady=5)
+
+# 生成按鈕
+generate_button = tk.Button(frame, text="Calculation Start", command=generate_portfolio)
+generate_button.grid(row=2, columnspan=2, pady=20)
+
+# 進度條
+progress_var = tk.DoubleVar()
+progress_bar = ttk.Progressbar(root, variable=progress_var, maximum=100)
+progress_bar.pack(pady=10)
+
+completion_label = tk.Label(root, text="")
+completion_label.pack()
+
+# 圖片展示
+button_frame = tk.Frame(root)
+button_frame.pack(pady=10)
+
+show_efficient_frontier_button = tk.Button(button_frame, text="Show Efficient Frontier", command=lambda: show_image("efficient_frontier.png"))
+show_efficient_frontier_button.grid(row=0, column=0, padx=10, pady=5)
+
+show_optimal_portfolio_weights_button = tk.Button(button_frame, text="Show Optimal Portfolio Weights", command=lambda: show_image("optimal_portfolio_weights.png"))
+show_optimal_portfolio_weights_button.grid(row=0, column=1, padx=10, pady=5)
+
+show_min_vol_portfolio_weights_button = tk.Button(button_frame, text="Show Min Vol Portfolio Weights", command=lambda: show_image("min_vol_portfolio_weights.png"))
+show_min_vol_portfolio_weights_button.grid(row=1, column=0, padx=10, pady=5)
+
+show_max_return_portfolio_weights_button = tk.Button(button_frame, text="Show Max Return Portfolio Weights", command=lambda: show_image("max_return_portfolio_weights.png"))
+show_max_return_portfolio_weights_button.grid(row=1, column=1, padx=10, pady=5)
+
+root.mainloop()
